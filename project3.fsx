@@ -9,27 +9,29 @@ open System.Security.Cryptography
 open System.Text
 ///////////////////////////Initialization////////////////////////////////////////
 
-type Message = 
-    | InitializeKeyValue of String
-    | Join
-    | Route
 
-type NodeData ={
-    Key: bigint
-    Value: bigint 
-    
-}
 type NodeExtraData= {
     NodeId: NodeData
     IPreference: IActorRef
 
 }
-
+and NodeData ={
+    Key: byte []
+    Value: bigint 
+    
+}
 type State = {
     SmallLeafSet:NodeExtraData [] 
     LargeLeafSet:NodeExtraData []
     RoutingTable: NodeExtraData [,]
 }
+
+type Message = 
+    
+    | Join of IActorRef
+    | Route of IActorRef
+    | UpdateState of IActorRef*State * int
+    | Received of int * IActorRef 
 
 let mutable nodes =
     int (string (fsi.CommandLineArgs.GetValue 1))
@@ -51,21 +53,44 @@ let sizeofhalfleafset = 8
 
 ///////////////////////////Worker Actor/ ///////////////////////////////////////
 let Worker(mailbox: Actor<_>) =
-    let state:State ={
-        SmallLeafSet = Array.create sizeofhalfleafset null
-        LargeLeafSet = Array.create sizeofhalfleafset null
-        RoutingTable = Array2D.create numberOfRows numberOfCols null
-
+    let ipAddressofCurrentNode  =  System.Text.Encoding.ASCII.GetBytes mailbox.Self.Path.Name
+    let hash = MD5.Create().ComputeHash(ipAddressofCurrentNode)
+    let mutable lastchangedtimestamp = 0
+    let selfNodeData = {
+        IPreference = mailbox.Self 
+        NodeId = {
+            Key = MD5.Create().ComputeHash(ipAddressofCurrentNode)
+            Value = bigint(hash)
+        }
     }
-    
 
+    let state:State ={
+        SmallLeafSet = Array.zeroCreate sizeofhalfleafset
+        LargeLeafSet = Array.zeroCreate sizeofhalfleafset
+        RoutingTable = Array2D.zeroCreate numberOfRows numberOfCols
+      }
+    
     let rec loop()= actor{
         let! message = mailbox.Receive();
-        
+            
         match message with
-        | InitializeKeyValue key ->
-             
+        | Join x -> 
+            nodeToSend = computeRouting x 
+            nodeToSend <! Join x
+            x <! UpdateState (mailbox.Self,state,lastchangedtimestamp)
         
+        | Route x ->
+            nodeToSend = computeRouting x
+            nodeToSend<! Route x
+
+        | UpdateState (referenceofSender,recievedState,recievedtimestamp)->
+            lastchangedtimestamp  <- lastchangedtimestamp + 1
+            // update the routing table
+            referenceofSender <! Received (recievedtimestamp,mailbox.Self)
+            
+        | Received (recieved_timestamp, referenceofSender) ->
+            if recieved_timestamp < lastchangedtimestamp then  
+                referenceofSender <! UpdateState (mailbox.Self,state,lastchangedtimestamp)
         
         return! loop()
     }            
@@ -78,19 +103,13 @@ let Worker(mailbox: Actor<_>) =
 
 nodeArray <- Array.zeroCreate (nodes + 1)
 
-let md5 (data : byte array) : string =
-    let md5 = MD5.Create()
-    (StringBuilder(), md5.ComputeHash(data))
-    ||> Array.fold (fun sb b -> sb.Append(b.ToString("x2")))
-    |> string
 
 for x in [0..nodes] do
     let actorkey : string = "actor" + string(x) 
     let actorRef = spawn system (actorkey) Worker
-    let keyHash: string = md5 "actorkey"B
     let value: string = "Actor invoked " + string(x)
     nodeArray.[x] <- actorRef 
-    nodeArray.[x] <! InitializeKeyValue (keyHash,value)
+    
 
 Console.ReadLine() |> ignore
 ///////////////////////////Program////////////////////////////////////////
