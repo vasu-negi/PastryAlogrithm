@@ -41,15 +41,14 @@ type Message =
     | FinishedSending
     | TotalNodesForInitialization of int
     
-let mutable nodes =
-    int (string (fsi.CommandLineArgs.GetValue 1))
-
+let mutable nodes = int (string (fsi.CommandLineArgs.GetValue 1))
 let numRequests = string (fsi.CommandLineArgs.GetValue 2)
 let system = ActorSystem.Create("System")
-let mutable actualNumOfNodes = nodes |> float
+
 
 
 let mutable  nodeArray = [||]
+
 let b = 2
 let numberOfRows = 128 / b
 let numberOfCols = pown 2 b
@@ -64,27 +63,28 @@ let Worker(mailbox: Actor<_>) =
     let mutable hashbyte = MD5.Create().ComputeHash(ipAddressofCurrentNode)
     let mutable bigintHash = bigint(hashbyte)
     let mutable hash : int [] = Array.zeroCreate b
+
     let pow2 = bigint(pown 2 b)
     for x = b-1 to 0 do 
         hash.[x] <- int(bigintHash % pow2)
         bigintHash <- bigintHash / pow2
 
     let mutable lastchangedtimestamp = 0
-    
-    let mutable numberOfneighborsFinishedSendingData = 0
-    let mutable numberofNeighboringActors= 0
+    let mutable numberOfneighborsFinishedSendingData = 0 
+    let mutable numberofNeighboringActors= 0 //total neighbors sending data back to the new Node
+
 
     let nodeId:NodeData = {
         Value = bigint(hashbyte)
         Key = hash
     }
+
     let selfNodeData = {
         IPreference = mailbox.Self 
         NodeId = nodeId
         IsnotNull = true
     }
     // Find Prefix length
-
     let findPrefixLength(sharedHash:int []) = 
         let mutable prefix = 0
         for i in 0..hash.Length-1 do
@@ -98,27 +98,31 @@ let Worker(mailbox: Actor<_>) =
         LargeLeafSet =  SortedSet<NodeExtraData>()
         RoutingTable = Array2D.create numberOfRows numberOfCols NodeExtraData.Default
     }
+    // first look up in the lowerleafset, to insert the new data
     let updateSmallLeafSet (sharedData:NodeExtraData) =
         if sharedData.NodeId.Value < selfNodeData.NodeId.Value then 
             if state.SmallLeafSet.Count < sizeofhalfleafset then
                 state.SmallLeafSet.Add(sharedData) |> ignore
             else 
                 let minValueInLeafSet = state.SmallLeafSet.Min
-                state.SmallLeafSet.Remove(minValueInLeafSet) |> ignore
-                state.SmallLeafSet.Add(sharedData) |> ignore
-
+                
+                if sharedData.NodeId.Value > minValueInLeafSet.NodeId.Value then
+                    state.SmallLeafSet.Remove(minValueInLeafSet) |> ignore
+                    state.SmallLeafSet.Add(sharedData) |> ignore
+    //  look up in the largerleafset, to insert the new data
     let updatelargeLeafSet (sharedData:NodeExtraData) =
         if sharedData.NodeId.Value > selfNodeData.NodeId.Value then 
             if state.LargeLeafSet.Count < sizeofhalfleafset then
                 state.LargeLeafSet.Add(sharedData) |> ignore
             else 
                 let maxValueInLeafSet = state.LargeLeafSet.Max
-                state.LargeLeafSet.Remove(maxValueInLeafSet) |> ignore
-                state.LargeLeafSet.Add(sharedData) |> ignore
+                
+                if sharedData.NodeId.Value < maxValueInLeafSet.NodeId.Value then
+                    state.LargeLeafSet.Remove(maxValueInLeafSet) |> ignore
+                    state.LargeLeafSet.Add(sharedData) |> ignore
 
-
+    // check the routing table, and leafset of the sharedData to put values into new Actor (Visiting) leafset
     let updateLeafSet (sharedState:State,sharedData:NodeExtraData) = 
-
         for i = 0 to numberOfRows - 1  do
             for j = 0 to numberOfCols - 1 do 
                 updateSmallLeafSet(sharedState.RoutingTable.[i,j]) |> ignore
@@ -126,14 +130,15 @@ let Worker(mailbox: Actor<_>) =
                 
         for lowerleaf in sharedState.SmallLeafSet do
             updateSmallLeafSet(lowerleaf) |> ignore
-            updateSmallLeafSet(lowerleaf) |> ignore
+            updatelargeLeafSet(lowerleaf) |> ignore
         for largerleaf in sharedState.LargeLeafSet do
+            updateSmallLeafSet(largerleaf) |> ignore
             updatelargeLeafSet(largerleaf) |> ignore
-            updatelargeLeafSet(largerleaf) |> ignore
-
+    // retreieves the next node based on the routing alogrithm 
     let getNextNode (sharedData: NodeExtraData) = 
         let mutable sharedValue = sharedData.NodeId.Value 
         let mutable nextNodeToSend:NodeExtraData = NodeExtraData.Default
+
         if ((sharedValue >= state.SmallLeafSet.Min.NodeId.Value) && (sharedValue <= state.LargeLeafSet.Max.NodeId.Value)) then
             let mutable smallestDifference:bigint =  bigint(pown 2 b)
             for leaves in state.SmallLeafSet do
@@ -145,7 +150,7 @@ let Worker(mailbox: Actor<_>) =
                     nextNodeToSend <- leaves
                     smallestDifference <- abs(leaves.NodeId.Value - sharedValue)
         else 
-            let mutable l = findPrefixLength(sharedData.NodeId.Key)
+            let mutable l = findPrefixLength(sharedData.NodeId.Key) // D 
             if state.RoutingTable.[l,sharedData.NodeId.Key.[l]].IsnotNull then
                 nextNodeToSend<- state.RoutingTable.[l,sharedData.NodeId.Key.[l]] 
             else
@@ -194,35 +199,35 @@ let Worker(mailbox: Actor<_>) =
                 nodeToSend.IPreference <! Join (x, (counter+1))
                 x.IPreference <! UpdateState (selfNodeData,state,lastchangedtimestamp)
             else 
+                // Reached Z, send number of total neighboractors to new actor X 
                 x.IPreference <! TotalNodesForInitialization counter
             
         | Route (x:NodeExtraData) ->
-            
             if x.NodeId.Value = selfNodeData.NodeId.Value then
                 printfn "Message Reached"
             let mutable nodeToSend = getNextNode x
             nodeToSend.IPreference<! Route x
             
-
+        // Update the state of own 
         | UpdateState (receivedData:NodeExtraData,receivedState:State, recievedtimestamp:int) ->
             lastchangedtimestamp  <- lastchangedtimestamp + 1
             let mutable prefixlength = findPrefixLength receivedData.NodeId.Key // send the hash value (nodeId)
             //Update the table
             for i = 0 to prefixlength do
                 for j = 0 to b do   
-                    if (i <> selfNodeData.NodeId.Key.[j] && (state.RoutingTable.[i,j].IsnotNull) &&  (not receivedState.RoutingTable.[i,j].IsnotNull))  then
+                    if (i <> receivedData.NodeId.Key.[j] && (not state.RoutingTable.[i,j].IsnotNull) &&  (receivedState.RoutingTable.[i,j].IsnotNull))  then
                         state.RoutingTable.[i,j] <- receivedState.RoutingTable.[i,j]
             //Updated the leafset
             updateLeafSet(receivedState, receivedData) 
             // Send received message with timestamp to the sender 
             receivedData.IPreference <! Received (recievedtimestamp,selfNodeData)
-
-        | Received (recieved_timestamp, sharedData) ->
+        // Send a message to the neighbor A...Z that the messgage has been received
+        | Received (recieved_timestamp:int, sharedData) ->
             if recieved_timestamp = lastchangedtimestamp then
                 sharedData.IPreference <! FinishedSending
             elif recieved_timestamp < lastchangedtimestamp then  
                 sharedData.IPreference <! UpdateState (selfNodeData,state,lastchangedtimestamp)
-
+        // If all the neighbors have shared the state with the new neighbor X, then send new neighbor's state to all the neighbors
         | FinishedSending -> 
             numberOfneighborsFinishedSendingData <- numberOfneighborsFinishedSendingData + 1
             if numberOfneighborsFinishedSendingData = numberofNeighboringActors then
